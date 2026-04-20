@@ -124,6 +124,84 @@ def get_text_frame_text(shape) -> str:
     return _normalize_text_block(text_frame.text)
 
 
+def reconstruct_table(elements: list[dict]) -> str | None:
+    """Attempt to reconstruct a Markdown table from scattered text blocks."""
+    if not elements:
+        return None
+
+    # Group elements by Top (Row) with 10% tolerance (using average top gap)
+    # Actually, a simple absolute tolerance is usually safer for PPTX EMUs.
+    # Let's say 100,000 EMU vertical tolerance for items in the same row.
+    ROW_TOLERANCE = 150000 
+    rows_dict = []
+    
+    # Sort elements by top to process sequentially
+    elements_sorted = sorted(elements, key=lambda x: x["top"])
+    
+    for el in elements_sorted:
+        placed = False
+        for row in rows_dict:
+            if abs(el["top"] - row["top_avg"]) < ROW_TOLERANCE:
+                row["elements"].append(el)
+                row["top_avg"] = sum(x["top"] for x in row["elements"]) / len(row["elements"])
+                placed = True
+                break
+        if not placed:
+            rows_dict.append({"top_avg": el["top"], "elements": [el]})
+
+    # Find column baselines by aggregating Left coordinates
+    left_coords = [el["left"] for el in elements]
+    COL_TOLERANCE = 300000 # Horizontal tolerance to cluster lefts
+    
+    col_clusters = []
+    for left in sorted(left_coords):
+        placed = False
+        for cluster in col_clusters:
+            if abs(left - cluster["avg"]) < COL_TOLERANCE:
+                cluster["count"] += 1
+                cluster["avg"] = ((cluster["avg"] * (cluster["count"] - 1)) + left) / cluster["count"]
+                placed = True
+                break
+        if not placed:
+            col_clusters.append({"avg": left, "count": 1})
+            
+    # Filter valid column baselines - must pop up frequently enough (e.g. at least 2 items)
+    valid_cols = sorted([c["avg"] for c in col_clusters if c["count"] >= 2])
+    
+    # Needs at least 2 columns to be considered a table
+    if len(valid_cols) < 2:
+        return None
+
+    lines = []
+    for row in rows_dict:
+        row_elements = row["elements"]
+        
+        # If it's a single element spanning, treat it as a special block (not table)
+        if len(row_elements) == 1:
+            lines.append(f"\n{row_elements[0]['text']}")
+            continue
+            
+        # Map elements to columns
+        row_cells = [""] * len(valid_cols)
+        for el in row_elements:
+            # Find closest valid col
+            closest_col_idx = min(range(len(valid_cols)), key=lambda i: abs(valid_cols[i] - el["left"]))
+            # If multiple elements map to the same cell, join them safely
+            if row_cells[closest_col_idx]:
+                row_cells[closest_col_idx] += " " + el["text"].replace("\n", " ")
+            else:
+                row_cells[closest_col_idx] = el["text"].replace("\n", " ")
+        
+        # Build Markdown table row
+        lines.append("| " + " | ".join(row_cells) + " |")
+        
+        # Add separator after first table row
+        if len(lines) == 1 or (len(lines) > 1 and not lines[-2].strip().startswith("|")):
+            lines.append("|" + "|".join(["---"] * len(valid_cols)) + "|")
+
+    return "\n".join(lines)
+
+
 def slide_to_markdown(slide, slide_number: int) -> str:
     """Render a single slide into markdown using grid-based spatial ordering."""
     elements_on_slide: list[dict[str, object]] = []
@@ -190,26 +268,49 @@ def slide_to_markdown(slide, slide_number: int) -> str:
     # Primary sort body by raw Left then Top
     body.sort(key=lambda item: (item["left"], item["top"]))
 
-    # Grid-Based Column grouping for Body (Tolerance roughly 5-10% of slide width ~600,000 EMU)
-    TOLERANCE = 600000
-    columns: list[list[dict[str, object]]] = []
+    # Table Reconstruction / Grid-Based Column grouping for Body
+    is_table = False
     
-    for el in body:
-        placed = False
+    # Simple check: do we have many items sharing the same top coordinates?
+    if len(body) > 4:
+        row_counts = {}
+        for b in body:
+            top_rounded = (int(b["top"]) // 100000) * 100000
+            row_counts[top_rounded] = row_counts.get(top_rounded, 0) + 1
+        
+        # If multiple rows have >1 item, it's very likely a table.
+        if sum(1 for count in row_counts.values() if count > 1) >= 2:
+            is_table = True
+
+    final_elements = []
+    if is_table:
+        table_md = reconstruct_table(body)
+        if table_md:
+            final_elements = headers + [{"text": table_md, "top": 0, "left": 0}] + footers
+        else:
+            is_table = False  # Fallback
+
+    if not is_table:
+        # Flowchart logic: group into Columns
+        TOLERANCE = 600000
+        columns: list[list[dict[str, object]]] = []
+        
+        for el in body:
+            placed = False
+            for col in columns:
+                if abs(int(el["left"]) - int(col[0]["left"])) < TOLERANCE:
+                    col.append(el)
+                    placed = True
+                    break
+            if not placed:
+                columns.append([el])
+
+        columns.sort(key=lambda col: sum(int(item["left"]) for item in col) / len(col))
+
         for col in columns:
-            if abs(int(el["left"]) - int(col[0]["left"])) < TOLERANCE:
-                col.append(el)
-                placed = True
-                break
-        if not placed:
-            columns.append([el])
+            col.sort(key=lambda item: item["top"])
 
-    columns.sort(key=lambda col: sum(int(item["left"]) for item in col) / len(col))
-
-    for col in columns:
-        col.sort(key=lambda item: item["top"])
-
-    final_elements = headers + [item for col in columns for item in col] + footers
+        final_elements = headers + [item for col in columns for item in col] + footers
 
     lines = [f"## Slide {slide_number}", ""]
     for item in final_elements:
