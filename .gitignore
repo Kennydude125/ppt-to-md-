@@ -1,0 +1,9 @@
+data/
+cleaned data/
+.venv/
+__pycache__/
+*.pptx
+*.pdf
+*.log
+.DS_Store
+.env
