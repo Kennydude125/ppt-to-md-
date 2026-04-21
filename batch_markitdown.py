@@ -39,7 +39,9 @@ def _collect_text_nodes(xml_root: ET.Element) -> list[str]:
 
 def _normalize_text_block(text: str) -> str:
     """Normalize a SmartArt text block for de-duplication."""
-    lines = [" ".join(line.split()) for line in text.splitlines()]
+    # Splitlines will split by markdown spaces we preserve (e.g. `  * `)
+    # We should NOT join the lines into one line anymore because Markdown lists require line breaks!
+    lines = [line.rstrip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line).strip()
 
 
@@ -112,8 +114,10 @@ def get_smartart_elements(shape) -> list[dict[str, object]]:
     return elements
 
 
+import re
+
 def get_text_frame_text(shape) -> str:
-    """Extract normalized text from a regular text frame."""
+    """Extract normalized text from a regular text frame with Markdown formatting."""
     if not getattr(shape, "has_text_frame", False):
         return ""
 
@@ -121,7 +125,49 @@ def get_text_frame_text(shape) -> str:
     if text_frame is None:
         return ""
 
-    return _normalize_text_block(text_frame.text)
+    lines = []
+    for p in text_frame.paragraphs:
+        p_text = ""
+        for run in p.runs:
+            run_text = run.text.replace("\n", " ")
+            if getattr(run.font, "bold", False) and run_text.strip():
+                stripped = run_text.strip()
+                # Wrap with markdown bold unless it's already wrapped (basic check)
+                run_text = run_text.replace(stripped, f"**{stripped}**")
+            p_text += run_text
+        
+        p_text = p_text.strip()
+        if not p_text:
+            continue
+            
+        # Strip existing PPT list bullet characters
+        p_text = re.sub(r'^([o\uf0b7\u25a0\u25cb\u2022\u25cf\uf0d8\u27a2\u25aa\u25a1]|\?)\s+', '', p_text)
+        
+        # Heading Detection
+        is_heading = False
+        # 1. Matches patterns like 5.1.4
+        if re.match(r'^\d+(\.\d+)+\s+', p_text):
+            is_heading = True
+        # 2. Heuristic for font size (if available and large enough, though runs can vary, we assume 18+ is heading)
+        elif p.runs and p.runs[0].font and p.runs[0].font.size and p.runs[0].font.size.pt > 20:
+            is_heading = True
+            
+        level = getattr(p, "level", 0)
+        
+        if is_heading:
+            # Decide header level (e.g. 5.1 -> ##, 5.1.4 -> ###)
+            h_match = re.match(r'^(\d+(?:\.\d+)+)', p_text)
+            if h_match:
+                dots = h_match.group(1).count('.')
+                h_prefix = "#" * min(dots + 2, 4)
+                lines.append(f"{h_prefix} {p_text}")
+            else:
+                lines.append(f"## {p_text}")
+        else:
+            indent = "  " * level
+            lines.append(f"{indent}* {p_text}")
+
+    return "\n".join(lines)
 
 
 def reconstruct_table(elements: list[dict]) -> str | None:
