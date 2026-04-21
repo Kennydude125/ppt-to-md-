@@ -10,7 +10,9 @@ except ImportError:
     MarkItDown = None
 
 try:
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
 except ImportError:
     DocumentConverter = None
 
@@ -73,18 +75,30 @@ def convert_pptx(file_path: Path) -> str:
 
 
 def convert_pdf(file_path: Path) -> str:
-    """Convert PDF using Docling (with OCR & Layout Analysis) or MarkItDown as fallback."""
-    if DocumentConverter is not None:
-        # Docling does advanced Layout Analysis by default
-        converter = DocumentConverter()
-        doc = converter.convert(str(file_path))
-        return doc.document.export_to_markdown()
-    
+    """Convert PDF using MarkItDown (more stable for large docs) or Docling as fallback."""
+    # Prioritize MarkItDown as it safely retrieves embedded text without OOM errors
     if MarkItDown is not None:
         md = MarkItDown()
         return md.convert(str(file_path)).text_content
         
-    raise ImportError("No PDF conversion library available (need Docling or MarkitDown).")
+    if DocumentConverter is not None:
+        try:
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = False
+            pipeline_options.do_table_structure = True
+            
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                }
+            )
+            doc = converter.convert(str(file_path))
+            return doc.document.export_to_markdown()
+        except Exception as e:
+            print(f" [Docling failed: {e}]", end="", flush=True)
+            return ""
+            
+    raise ImportError("No PDF conversion library available (need MarkitDown or Docling).")
 
 
 def convert_docx(file_path: Path) -> str:
